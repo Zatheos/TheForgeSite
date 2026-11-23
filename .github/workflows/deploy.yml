@@ -1,0 +1,101 @@
+name: Deploy to forge.ybgc.co.uk
+
+# Runs whenever someone pushes to the live branch.
+# Can also be started by hand from the GitHub "Actions" tab, optionally as a
+# dry run that only lists what would be uploaded/deleted.
+on:
+  push:
+    branches: [live]
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Dry run: only show what would change, don't touch the server"
+        type: boolean
+        default: true
+
+# Never run two deploys at once; a newer push waits for the older one.
+concurrency:
+  group: deploy-live
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      # Always deploys the live branch, including manual (dry) runs.
+      - name: Check out the live branch
+        uses: actions/checkout@v4
+        with:
+          ref: live
+
+      - name: Install lftp
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq lftp
+
+      - name: Mirror site to server
+        env:
+          # All set under Settings > Secrets and variables > Actions.
+          DEPLOY_PROTOCOL: ${{ secrets.DEPLOY_PROTOCOL }}
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_PORT: ${{ secrets.DEPLOY_PORT }}
+          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+          DEPLOY_PATH: ${{ secrets.DEPLOY_PATH }}
+          LFTP_PASSWORD: ${{ secrets.DEPLOY_PASSWORD }}
+          DRY_RUN: ${{ inputs.dry_run && '--dry-run' || '' }}
+        run: |
+          set -euo pipefail
+          for v in DEPLOY_HOST DEPLOY_USER DEPLOY_PATH LFTP_PASSWORD; do
+            if [ -z "${!v:-}" ]; then
+              name="$v"; [ "$v" = LFTP_PASSWORD ] && name=DEPLOY_PASSWORD
+              echo "The $name secret is missing: add it under Settings > Secrets and variables > Actions"; exit 1
+            fi
+          done
+          if [ "$DEPLOY_PATH" = "/" ]; then
+            echo "DEPLOY_PATH must be the site folder, not /"; exit 1
+          fi
+          PROTOCOL="${DEPLOY_PROTOCOL:-sftp}"
+          PORT_ARG=""
+          if [ -n "${DEPLOY_PORT:-}" ]; then PORT_ARG="-p ${DEPLOY_PORT}"; fi
+
+          if [ -n "$DRY_RUN" ]; then
+            echo "DRY RUN - nothing will be changed on the server"
+            echo "--- Current contents of the site folder ---"
+            lftp --env-password -u "$DEPLOY_USER" $PORT_ARG "$PROTOCOL://$DEPLOY_HOST" <<EOF
+          set sftp:auto-confirm yes
+          set cmd:fail-exit yes
+          set net:max-retries 1
+          set net:timeout 20
+          cd "$DEPLOY_PATH"
+          pwd
+          cls -1a
+          bye
+          EOF
+            echo "--- Planned changes ---"
+          fi
+
+          # Makes the server folder match the repo exactly: uploads new/changed
+          # files and DELETES files on the server that aren't in the repo.
+          # cmd:fail-exit + cd first: if the folder doesn't exist the run stops
+          # instead of uploading somewhere else.
+          # Excluded paths are neither uploaded nor deleted. .htaccess,
+          # .well-known and cgi-bin are hosting files on the server to keep.
+          lftp --env-password -u "$DEPLOY_USER" $PORT_ARG "$PROTOCOL://$DEPLOY_HOST" <<EOF
+          set sftp:auto-confirm yes
+          set cmd:fail-exit yes
+          set net:max-retries 3
+          set net:timeout 30
+          cd "$DEPLOY_PATH"
+          mirror --reverse --delete --verbose $DRY_RUN \
+            --exclude-glob .git/ \
+            --exclude-glob .github/ \
+            --exclude-glob .claude/ \
+            --exclude-glob .vscode/ \
+            --exclude-glob .DS_Store \
+            --exclude-glob .gitignore \
+            --exclude-glob .gitattributes \
+            --exclude-glob "*.md" \
+            --exclude-glob .htaccess \
+            --exclude-glob .well-known/ \
+            --exclude-glob cgi-bin/ \
+            ./ ./
+          bye
+          EOF
